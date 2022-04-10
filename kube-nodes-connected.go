@@ -5,13 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/golang/glog"
 	ff "github.com/peterbourgon/ff/v3"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -34,8 +37,9 @@ func main() {
 
 	verbosity := fs.String("v", "", "Log verbosity.  {4|5|6}")
 	endpointsName := fs.String("endpoints", "", "Endpoints object to monitor for peer services")
-	address := fs.String("address", "127.0.0.1:80", "Address to listen on")
+	address := fs.String("address", "0.0.0.0:80", "Address to listen on")
 	namespace := fs.String("namespace", "default", "Kubernetes namespace to monitor")
+	ownPodIp := fs.String("own-pod-ip", "", "IP address of this node (for skipping)")
 
 	ff.Parse(
 		fs, os.Args[1:],
@@ -69,6 +73,10 @@ func main() {
 	if err != nil {
 		panic(err.Error())
 	}
+
+	// Not immediately known, but we'll find it in the endpoints list
+	var ownNodeName string
+
 	for {
 		// Examples for error handling:
 		// - Use helper functions e.g. errors.IsNotFound()
@@ -80,10 +88,39 @@ func main() {
 			glog.Fatalf("Error getting endpoints %v\n", statusError.ErrStatus.Message)
 		} else if err != nil {
 			panic(err.Error())
-		} else {
-			glog.Infof("Endpoints: %v", endpoints)
 		}
 
-		time.Sleep(60 * time.Second)
+		var wg sync.WaitGroup
+
+		for _, subset := range endpoints.Subsets {
+			for _, address := range subset.Addresses {
+				if address.IP == *ownPodIp {
+					ownNodeName = *address.NodeName
+					continue
+				}
+				wg.Add(1)
+				go func(addr v1.EndpointAddress) {
+					var netClient = &http.Client{
+						Timeout: time.Second * 10,
+					}
+					resp, err := netClient.Get(fmt.Sprintf("http://%s/", addr.IP))
+					if err != nil {
+						glog.Errorf("NODE_TIMEOUT localNode=%s remoteNode=%s localIP=%s remoteIP=%s", ownNodeName, *addr.NodeName, *ownPodIp, addr.IP)
+						wg.Done()
+						return
+					}
+					defer resp.Body.Close()
+					_, err = io.ReadAll(resp.Body)
+					if resp.StatusCode != 200 {
+						glog.Errorf("UNEXPECTED_STATUS localNode=%s remoteNode=%s localIP=%s remoteIP=%s", ownNodeName, *addr.NodeName, *ownPodIp, addr.IP)
+					}
+					wg.Done()
+				}(address)
+			}
+		}
+
+		wg.Wait()
+
+		time.Sleep(5 * time.Second)
 	}
 }
