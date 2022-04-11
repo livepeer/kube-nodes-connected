@@ -59,7 +59,7 @@ func main() {
 	})
 
 	go func() {
-		glog.Infof("Listening on %s", address)
+		glog.Infof("Listening on %s", *address)
 		log.Fatal(http.ListenAndServe(*address, nil))
 	}()
 
@@ -78,9 +78,7 @@ func main() {
 	var ownNodeName string
 
 	for {
-		// Examples for error handling:
-		// - Use helper functions e.g. errors.IsNotFound()
-		// - And/or cast to StatusError and use its properties like e.g. ErrStatus.Message
+		glog.V(6).Infof("Starting endpoints query")
 		endpoints, err := clientset.CoreV1().Endpoints(*namespace).Get(context.TODO(), *endpointsName, metav1.GetOptions{})
 		if errors.IsNotFound(err) {
 			glog.Fatalf("Endpoints %s not found in default namespace", *endpointsName)
@@ -89,8 +87,13 @@ func main() {
 		} else if err != nil {
 			panic(err.Error())
 		}
+		glog.V(6).Infof("Finished endpoints query, starting HTTP requests")
 
 		var wg sync.WaitGroup
+
+		start := time.Now()
+		successes := 0
+		total := 0
 
 		for _, subset := range endpoints.Subsets {
 			for _, address := range subset.Addresses {
@@ -98,12 +101,15 @@ func main() {
 					ownNodeName = *address.NodeName
 					continue
 				}
+				total += 1
 				wg.Add(1)
 				go func(addr v1.EndpointAddress) {
 					var netClient = &http.Client{
 						Timeout: time.Second * 10,
 					}
-					resp, err := netClient.Get(fmt.Sprintf("http://%s/", addr.IP))
+					reqUrl := fmt.Sprintf("http://%s/", addr.IP)
+					glog.V(6).Infof("Starting request to %s: %s", *addr.NodeName, reqUrl)
+					resp, err := netClient.Get(reqUrl)
 					if err != nil {
 						glog.Errorf("NODE_TIMEOUT localNode=%s remoteNode=%s localIP=%s remoteIP=%s", ownNodeName, *addr.NodeName, *ownPodIp, addr.IP)
 						wg.Done()
@@ -111,15 +117,26 @@ func main() {
 					}
 					defer resp.Body.Close()
 					_, err = io.ReadAll(resp.Body)
+					if err != nil {
+						glog.Errorf("BODY_READ_FAILURE localNode=%s remoteNode=%s localIP=%s remoteIP=%s", ownNodeName, *addr.NodeName, *ownPodIp, addr.IP)
+						wg.Done()
+						return
+					}
 					if resp.StatusCode != 200 {
 						glog.Errorf("UNEXPECTED_STATUS localNode=%s remoteNode=%s localIP=%s remoteIP=%s", ownNodeName, *addr.NodeName, *ownPodIp, addr.IP)
+						wg.Done()
+						return
 					}
+					successes += 1
 					wg.Done()
 				}(address)
 			}
 		}
 
 		wg.Wait()
+		took := time.Since(start).Seconds()
+		glog.Infof("Got %d/%d responses in %.2fs", successes, total, took)
+		glog.V(6).Infof("Sleeping for 5 seconds")
 
 		time.Sleep(5 * time.Second)
 	}
